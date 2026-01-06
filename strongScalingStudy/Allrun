@@ -1,0 +1,200 @@
+#!/bin/bash
+
+# Source required functions
+. $WM_PROJECT_DIR/bin/tools/RunFunctions
+source solids4FoamScripts.sh
+
+# Compile the manucafturedSolution library
+(cd .. && ./Allclean && ./Allwmake 2>/dev/null)
+
+# Define configurations as space-separated strings
+configs=(
+    "BASE=base/hex-mesh-2D NAME=hex-2D UTIL_NAME=testBuildStencilsParallel UTIL_ARGS='-radius 0.25' USE_DUALMESH=0 USE_GMSH=0"
+    "BASE=base/hex-mesh-3D NAME=hex-3D UTIL_NAME=testBuildStencilsParallel UTIL_ARGS='-radius 0.25' USE_DUALMESH=0 USE_GMSH=0"
+)
+
+# Define number of cores to be tested
+CORES=(1 2 4 8)
+
+# Define start and end mesh indices
+# Mesh input files are defined from 1 to 6
+# END_MESH should be greater than START_MESH
+START_MESH=1
+END_MESH=6
+
+# Detect the CPU type: we append this to the case name
+if [[ "$OSTYPE" == "darwin"* ]]
+then
+    # macOS
+    CPU_TYPE=$(sysctl -n machdep.cpu.brand_string | sed 's/[^a-zA-Z0-9]/_/g')
+elif [[ -f /proc/cpuinfo ]]
+then
+    # Linux
+    CPU_TYPE=$(grep -m 1 "model name" /proc/cpuinfo | awk -F': ' '{print $2}' | sed 's/[^a-zA-Z0-9]/_/g')
+else
+    # Fallback if neither method works
+    CPU_TYPE="Unknown_CPU"
+fi
+
+
+# Create timestamped working directory for this run
+DATE=$(date +%Y-%m-%d_%H-%M-%S)
+RUN_DIR="run_${CPU_TYPE}_${DATE}"
+echo "Creating ${RUN_DIR}"
+mkdir "${RUN_DIR}"
+
+# Enter the run directory
+cd "${RUN_DIR}"
+
+# Iterate through configurations
+for config in "${configs[@]}"
+do
+    # Reset variables in the case some variable is not used
+    unset NAME UTIL_NAME USE_GMSH USE_DUALMESH
+
+    # Parse the configuration string
+    eval $config
+    echo; echo "***************************************"
+    echo "Running configuration: $config"
+    echo "***************************************"
+
+    for i in `seq $START_MESH $END_MESH`
+    do
+        # Define results summary file name
+        SUMMARY="${NAME}.mesh-${i}.summary.txt"
+        echo "# Cores CellsNumber Time Speed-up Mem" > "${SUMMARY}"
+
+	T1=""
+        # Loop over mesh densities in each configuration
+        for NP in "${CORES[@]}"
+        do
+            CASE="${NAME}.mesh-${i}.cores-$NP"
+            echo; echo "Processing case: $CASE"
+
+            # Prepare the case
+            cp -rL "../${BASE}" "${CASE}"
+            cd "$CASE"
+
+           # Mesh generation logic
+            if [ "$USE_GMSH" -eq 1 ]
+            then
+                # GMSH-specific operations
+                cp "gmsh/meshSpacing${i}.geo" "gmsh/meshSpacing.geo"
+                solids4Foam::runApplication gmsh -3 -format msh2 gmsh/cube.geo
+                solids4Foam::runApplication gmshToFoam gmsh/cube.msh
+                solids4Foam::runApplication createPatch -overwrite
+                if [ "$USE_DUALMESH" -eq 1 ]; then
+                    solids4Foam::runApplication polyDualMesh 30 -overwrite
+                    solids4Foam::runApplication combinePatchFaces 45 -overwrite
+                fi
+            else
+                # blockMesh-specific operations
+                cp "system/blockMeshDict.${i}" "system/blockMeshDict"
+                solids4Foam::runApplication blockMesh
+            fi
+    	    solids4Foam::runApplication checkMesh
+
+    	    # Update the number of processors in decomposeParDict
+            sed -i "/^\s*numberOfSubdomains /s|^.*|numberOfSubdomains  ${NP};|" system/decomposeParDict
+
+    	    # Decompose the case
+    	    if [ "$NP" -ne 1 ]; then
+    		solids4Foam::runApplication decomposePar -cellDist
+    	    fi
+
+            # Run the utility
+            # If "gtime" is available (could be called "time" on Linux), use it to
+            # record the max memory usage
+            UTIL_ARGS=${UTIL_ARGS:-""}
+            read -r -a UTIL_ARGS_ARR <<< "$UTIL_ARGS"
+
+            if [ "$NP" -eq 1 ]; then
+                RUN_CMD=("${UTIL_NAME}" "${UTIL_ARGS_ARR[@]}")
+            else
+                RUN_CMD=(mpirun -np "${NP}" "${UTIL_NAME}" -parallel "${UTIL_ARGS_ARR[@]}")
+            fi
+
+            if command -v gtime &> /dev/null; then
+                echo "Running ${UTIL_NAME} on ${CASE} with gtime"
+                gtime -f "gtime/time (wall clock) time: %e
+                	  Maximum resident set size (kbytes): %M" \
+                      "${RUN_CMD[@]}" &> "log.${UTIL_NAME}"
+
+            elif [ -x /usr/bin/time ]; then
+                echo "Running ${UTIL_NAME} on ${CASE} with /usr/bin/time"
+                /usr/bin/time -f "gtime/time (wall clock) time: %e
+                	  Maximum resident set size (kbytes): %M" \
+    		  "${RUN_CMD[@]}" &> "log.${UTIL_NAME}"
+
+            elif command -v time &> /dev/null; then
+                echo "Running ${UTIL_NAME} on ${CASE} with shell builtin time (no max memory)"
+                time "${RUN_CMD[@]}" &> "log.${UTIL_NAME}"
+
+            else
+                echo "Running ${UTIL_NAME} on ${CASE}"
+                solids4Foam::runApplication "${RUN_CMD[@]}"
+            fi
+
+    	    # Reconstruct the case
+    	    if [ "$NP" -ne 1 ]; then
+    		solids4Foam::runApplication reconstructPar -withZero
+    	    fi
+
+            # Extract results from solver log and append them to a summary file
+            echo; echo "Appending results to ${SUMMARY}"
+            if grep -q "gtime/time" log.${UTIL_NAME}; then
+                CLOCK_TIME=$(grep "gtime/time" log."${UTIL_NAME}" | awk '{print $5}')
+            else
+                # Record the time
+                CLOCK_TIME=$(grep "ClockTime" log."${UTIL_NAME}" | awk '{print $7}')
+            fi
+
+    	    if grep -q "Maximum resident" log.${UTIL_NAME}; then
+                MAX_MEMORY=$(grep "Maximum resident" log."${UTIL_NAME}" | awk '{print int($6 / 1000)}')
+            else
+                MAX_MEMORY="NaN"
+            fi
+
+            # Number of cells
+            CELLS=$(grep "cells:" log.checkMesh | awk '{print $2}')
+
+	    # Save baseline time when running on 1 core
+	    if [ "$NP" -eq 1 ]; then
+		T1="$CLOCK_TIME"
+	    fi
+
+	    # Normalized time = T(NP) / T(1)
+	    SPEEDUP=$(awk -v t="$CLOCK_TIME" -v t1="$T1" 'BEGIN{
+                if (t1=="" || t1==0) print "NaN";
+                else printf "%.6f", t1/t
+            }')
+
+            # Write data to file
+            echo "$NP $CELLS $CLOCK_TIME $SPEEDUP $MAX_MEMORY" >> ../"${SUMMARY}"
+
+            cd ..
+        done
+	# Print summary file
+	echo; echo "${SUMMARY} file:"; cat "${SUMMARY}"; echo
+    done
+
+done
+
+# Create plots if gnuplot in installed
+if command -v gnuplot &>/dev/null
+then
+    # Copy gnuplot scripts
+    cp ../plotScripts/*gnuplot .
+
+    # Run all scripts
+    for f in *gnuplot
+    do
+        echo "Running gnuplot on $f"
+        gnuplot "$f" 2>/dev/null
+    done
+fi
+
+echo; echo; echo "Done!"; echo
+echo "View the PDF files in ${RUN_DIR}"
+echo; echo $(date)
+echo; echo
