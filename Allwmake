@@ -12,3 +12,4 @@ then
 fi
 
 wmake testBuildStencilsParallel
+wmake testBuildStencilsParallel_v2
