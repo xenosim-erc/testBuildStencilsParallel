@@ -44,65 +44,62 @@ Author
 #include "boundBox.H"
 #include "DynamicList.H"
 #include "HashSet.H"
+#include "HashTable.H"
 #include "PtrList.H"
 #include "Map.H"
 #include "labelPair.H"
 #include "processorPolyPatch.H"
+#include "globalIndex.H"
 
 
 // * * * * * * * * * * * * * * Helper Functions  * * * * * * * * * * * * * * //
 
 
-static void writeStencilPerProcFields
+static PtrList<volScalarField> writeStencilFields
 (
     const fvMesh& mesh,
-    const Time& runTime,
-    const List<labelList>& cellsUsedByProc,
-    const label debug = 0
+    const List<labelHashSet>& cellsUsedByProc
 )
 {
-    for (label p = 0; p < Pstream::nProcs(); ++p)
+    const label nProcs = Pstream::nProcs();
+    PtrList<volScalarField> fields(nProcs);
+
+    for (label p = 0; p < nProcs; ++p)
     {
-        if (cellsUsedByProc[p].empty())
-	{
-	    continue;
-	}
+        word fldName("stencilProc" + Foam::name(p));
 
-        const word fieldName("stencilProc_" + Foam::name(p));
-
-        volScalarField f
+        fields.set
         (
-            IOobject
+            p,
+            new volScalarField
             (
-                fieldName,
-                runTime.timeName(),
+                IOobject
+                (
+                    fldName,
+                    mesh.time().timeName(),
+                    mesh,
+                    IOobject::NO_READ,
+                    IOobject::AUTO_WRITE
+                ),
                 mesh,
-                IOobject::NO_READ,
-                IOobject::AUTO_WRITE
-            ),
-            mesh,
-            dimensionedScalar("zero", dimless, 0.0)
+                dimensionedScalar("zero", dimless, 0.0)
+            )
         );
 
-        const labelList& lst = cellsUsedByProc[p];
-        forAll(lst, i)
+        volScalarField& f = fields[p];
+
+        forAllConstIter(labelHashSet, cellsUsedByProc[p], iter)
         {
-	    const label c = lst[i];
-	    if (c >= 0 && c < mesh.nCells())
-	    {
-		f[c] = 1.0;
-	    }
+            f[iter.key()] = 1.0;
         }
 
         f.correctBoundaryConditions();
         f.write();
-
-        if (debug)
-        {
-            Info<< "Wrote field: " << fieldName << " size=" << lst.size() << nl;
-        }
     }
+
+    return fields;
 }
+
 
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
@@ -134,11 +131,11 @@ int main(int argc, char *argv[])
     Info<< "Debug level = " << debug << nl << endl;
     Info<< "Testing on nProcs: " << Pstream::nProcs() << endl;
 
-    //
+    // ---------------------------------------------------------------------- //
     // 0. step - Get faces for which we will build stencil. On processor
     // boundary, processor that is face owner holds the face to avoid double
     // counting.
-    //
+    // ---------------------------------------------------------------------- //
     const vectorField& Cf = mesh.Cf();
     const vectorField& C = mesh.C();
     const scalarField& V = mesh.V();
@@ -150,6 +147,7 @@ int main(int argc, char *argv[])
 	    << nLocalCells << " cells" << endl;
     }
 
+    // I should use dynamic list only for processor faces? Why copy all faces?
     DynamicList<label> ownedFaces;
     {
 	ownedFaces.reserve(mesh.nInternalFaces());
@@ -159,6 +157,9 @@ int main(int argc, char *argv[])
 	{
 	    ownedFaces.append(faceI);
 	}
+
+	// For debug purpose
+	label nProcFacesOwnedLocal = 0;
 
 	// Add processor boundary faces
 	forAll(mesh.boundaryMesh(), patchI)
@@ -172,6 +173,8 @@ int main(int argc, char *argv[])
 
 		if (ppp.owner())
 		{
+		    nProcFacesOwnedLocal += pp.size();
+
 		    forAll(pp, i)
 		    {
 		        ownedFaces.append(pp.start() + i);
@@ -182,63 +185,89 @@ int main(int argc, char *argv[])
 
 	if (debug)
 	{
+	    const label nInternalLocal = mesh.nInternalFaces();
+	    const label nOwnedLocal    = ownedFaces.size();
+
 	    Pout<< "Processor: " << Pstream::myProcNo() << " owns "
-		<< ownedFaces.size() << " faces" << endl;
+		<< nOwnedLocal << " faces. Of which " << nInternalLocal
+		<< " are internal faces." << endl;
+
+	    const label nInternalGlobal =
+		returnReduce(nInternalLocal, sumOp<label>());
+
+	    const label nProcFacesOwnedGlobal =
+		returnReduce(nProcFacesOwnedLocal, sumOp<label>());
+
+	    const label nOwnedGlobal =
+		returnReduce(nOwnedLocal, sumOp<label>());
+
+	    Info<< nl << "Total number of owned faces: " << nOwnedGlobal << nl
+		<< "Total number of owned processor faces: "
+		<< nProcFacesOwnedGlobal
+		<< nl << "Total numner of internal faces: " << nInternalGlobal
+		<< endl;
 	}
     }
 
-    //
-    // 1. step - calculate and exchange halo thickness
-    //
+    // ---------------------------------------------------------------------- //
+    // 1. step - calculate and exchange halo thickness. Total halo depth is
+    //           average depth of first layer multiplied with 5
+    //           Mulitplication with 5 avoid calculating 5 layer depth but
+    //           insert assumption that cells are uniform near proc boundary
+    // ---------------------------------------------------------------------- //
+
 
     // Halo cells that owns this processor, we will take average over multiple
     // processor boundaries
     labelHashSet haloCells;
-    forAll(mesh.boundaryMesh(), patchi)
-    {
-	const polyPatch& pp = mesh.boundaryMesh()[patchi];
-	if (!isA<processorPolyPatch>(pp))
-	{
-	    continue;
-	}
+    scalar procPatchArea = 0.0;
+    scalar haloVol = 0.0;
 
-	const labelUList& faceCells = pp.faceCells();
-	forAll(faceCells, i)
+    forAll(mesh.boundaryMesh(), patchI)
+    {
+	const polyPatch& pp = mesh.boundaryMesh()[patchI];
+	if (isA<processorPolyPatch>(pp))
 	{
-	    haloCells.insert(faceCells[i]);
+	    const vectorField& Sf = pp.faceAreas();
+	    const labelUList& faceCells = pp.faceCells();
+	    forAll(faceCells, i)
+	    {
+		haloCells.insert(faceCells[i]);
+		procPatchArea += mag(Sf[i]);
+		haloVol += V[faceCells[i]];
+	    }
 	}
     }
 
-    scalar sumV = 0.0;
-    label  nV   = 0;
-
-    forAllConstIter(labelHashSet, haloCells, iter)
-    {
-	const label c = iter.key();
-	sumV += V[c];
-	++nV;
-    }
-
-    const scalar haloAvgVLocal =
-	(nV > 0 ? sumV / scalar(nV) : 0.0);
+    // Halo depth on this processor
     const scalar haloDepthLocal  =
-	(haloAvgVLocal > 0 ? Foam::cbrt(haloAvgVLocal) : 0.0);
+    	(procPatchArea > 0 ? haloVol/procPatchArea : 0.0);
 
-    labelHashSet nbrSet;
-    forAll(mesh.boundaryMesh(), patchi)
+    if (debug)
     {
-	const polyPatch& pp = mesh.boundaryMesh()[patchi];
-	if (!isA<processorPolyPatch>(pp))
+	Pout<< "Processor: " << Pstream::myProcNo() << " halo thicnkess depth "
+	    << "on this processor: " << haloDepthLocal
+	    << ", halo volume: " << haloVol << ", procPatch area: "
+	    << procPatchArea << endl;
+    }
+
+    // We need to exchance halo depths, becouse this processor needs halo depth
+    // on neigbouring processors
+    labelHashSet nbrSet;
+    forAll(mesh.boundaryMesh(), patchI)
+    {
+	const polyPatch& pp = mesh.boundaryMesh()[patchI];
+	if (isA<processorPolyPatch>(pp))
 	{
-	    continue;
+	    const processorPolyPatch& ppp =
+		refCast<const processorPolyPatch>(pp);
+	    nbrSet.insert(ppp.neighbProcNo());
 	}
-	const processorPolyPatch& ppp = refCast<const processorPolyPatch>(pp);
-	nbrSet.insert(ppp.neighbProcNo());
     }
 
     labelList nbrs(nbrSet.toc());
 
-    // Exchange haloDepth with other processors
+    // Point to point exchange of haloDepth
     List<scalar> neighHaloDepth(Pstream::nProcs(), 0.0);
 
     PstreamBuffers pBufs(Pstream::commsTypes::nonBlocking);
@@ -261,17 +290,23 @@ int main(int argc, char *argv[])
 	}
     }
 
-    const scalar maxHaloDepth = max(neighHaloDepth);
-    const scalar haloRadius = 5 * maxHaloDepth;
+    const scalar haloDepth = 5 * max(neighHaloDepth);
 
-    //
-    // 2. step - build treeBoundBox for processor faces
-    //
+    if (debug)
+    {
+	Pout<< "Processor: " << Pstream::myProcNo() << " halo thicnkess depth "
+	    << "on neigbours multiplied with scaling: " << haloDepth << endl;
+    }
+
+    // ---------------------------------------------------------------------- //
+    // 2. step - build treeBoundBox for owned faces (inflated with halo depth)
+    // ---------------------------------------------------------------------- //
+
     treeBoundBox ownedFacesBox;
 
     if (ownedFaces.empty())
     {
-	// Empty rank
+	// Empty rank - something went wrong?
 	ownedFacesBox = treeBoundBox(vector::zero, vector::zero);
     }
     else
@@ -287,15 +322,16 @@ int main(int argc, char *argv[])
 	}
 
 	// Expand domain for halo thickness
-	minPt -= vector(haloRadius, haloRadius, haloRadius);
-	maxPt += vector(haloRadius, haloRadius, haloRadius);
+	minPt -= vector(haloDepth, haloDepth, haloDepth);
+	maxPt += vector(haloDepth, haloDepth, haloDepth);
 
 	ownedFacesBox = treeBoundBox(minPt, maxPt);
     }
 
-    //
-    // 3. step - build treeBoundBox for processor cells
-    //
+    // ---------------------------------------------------------------------- //
+    // 3. step - build treeBoundBox for owned cells and build global list of
+    //           treeBoundBox
+    // ---------------------------------------------------------------------- //
 
     treeBoundBox ownedCellsBox;
     {
@@ -311,7 +347,6 @@ int main(int argc, char *argv[])
         ownedCellsBox = treeBoundBox(minPt, maxPt);
     }
 
-    // TO DO: This should be replaced with neighbor-only layering.
     List<treeBoundBox> allOwnedCellsBox(Pstream::nProcs());
     allOwnedCellsBox[Pstream::myProcNo()] = ownedCellsBox;
 
@@ -322,15 +357,18 @@ int main(int argc, char *argv[])
 	Info<< "Gathered processor cell boxes from all ranks." << nl << endl;
     }
 
-    //
+    // ---------------------------------------------------------------------- //
     // 4. step - decide which processor will comunicate with this one
-    //
+    // ---------------------------------------------------------------------- //
+
     DynamicList<label> procToQuery;
 
     for (label proc = 0; proc < Pstream::nProcs(); ++proc)
     {
-	if (proc == Pstream::myProcNo()) continue;
-
+	if (proc == Pstream::myProcNo())
+	{
+	    continue;
+	}
 	if (allOwnedCellsBox[proc].overlaps(ownedFacesBox))
 	{
 	    procToQuery.append(proc);
@@ -343,114 +381,138 @@ int main(int argc, char *argv[])
 	     << procToQuery.size() << " processors: " << procToQuery << endl;
     }
 
-    // Send ownedFacesBox to other processors, receive boxes from others and
-    // respond with cell lists
-    List<labelList> replyToProc(Pstream::nProcs());
+    // ---------------------------------------------------------------------- //
+    // 5. step - send ownedFacesBox to other processors,
+    //           receive boxes from others and respond with cell lists
+    // ---------------------------------------------------------------------- //
+
+    // We will store remote cell ID with global indexing
+    globalIndex globalCells(mesh.nCells());
+
+    // Inverse map for writing fields (which processors are using this one data)
+    List<labelHashSet> cellsUsedByProc;
+
+    //  Needed remote cells (with global indexing)
+    List<labelList> remoteCellsPerProc;
+
+    cellsUsedByProc.setSize(Pstream::nProcs());
+    remoteCellsPerProc.setSize(Pstream::nProcs());
+
+    forAll(remoteCellsPerProc, procI)
     {
-	// Send my processor faces box to neighbouring processors
-	PstreamBuffers pBufs(Pstream::commsTypes::nonBlocking);
+	cellsUsedByProc[procI].clear();
+	remoteCellsPerProc[procI].clear();
+    }
+
+    // Phase 1: Exchange treeBoundBoxes between processors
+    Map<treeBoundBox> incomingBoxesFromProc;
+    {
+	PstreamBuffers sBufs(Pstream::commsTypes::nonBlocking);
 
 	forAll(procToQuery, i)
 	{
-	    const label& toProc = procToQuery[i];
-	    UOPstream os(toProc, pBufs);
+	    const label toProc = procToQuery[i];
+	    UOPstream os(toProc, sBufs);
 	    os << ownedFacesBox;
 	}
 
-        pBufs.finishedSends();
+	sBufs.finishedSends();
 
-	// Recieve processor faces boxes and answer with list of cells inside
-	for (label fromProc = 0; fromProc < Pstream::nProcs(); ++fromProc)
+	for (label p = 0; p < Pstream::nProcs(); ++p)
 	{
-	    if (fromProc == Pstream::myProcNo())
+	    if (!sBufs.recvDataCount(p) || p == Pstream::myProcNo())
 	    {
 		continue;
 	    }
+	    UIPstream is(p, sBufs);
+	    treeBoundBox qb;
+	    is >> qb;
 
-	    if (pBufs.recvDataCount(fromProc))
-	    {
-		UIPstream is(fromProc, pBufs);
-		treeBoundBox qb;
-		is >> qb;
-
-		DynamicList<label> hits;
-
-		// Guess: reserve size is 10% of cells at this proc
-		const label reserveSize  =
-		    min(max(label(0.1*nLocalCells), 1024), 200000);
-
-		hits.reserve(reserveSize);
-
-		// This is location where we can acheve speed-up becouse right
-		// now, we check the whole domain.
-		forAll(C, cellI)
-		{
-		    if (qb.contains(C[cellI]))
-		    {
-			hits.append(cellI);
-		    }
-		}
-
-		replyToProc[fromProc].transfer(hits);
-	    }
+	    incomingBoxesFromProc.insert(p, qb);
 	}
     }
 
-    // Send and receieve cell ID lists from neighbouring processors
-    List<labelList> remoteCells(Pstream::nProcs());
+    // Phase 2: Mark cells in overlaping boxes and fill out remoteCells list
     {
-	PstreamBuffers pBufs(Pstream::commsTypes::nonBlocking);
+	PstreamBuffers rBufs(Pstream::commsTypes::nonBlocking);
 
-	for (label toProc = 0; toProc < Pstream::nProcs(); ++toProc)
+	forAllConstIter(Map<treeBoundBox>, incomingBoxesFromProc, it)
 	{
-	    if (toProc == Pstream::myProcNo())
+	    const label sender = it.key();
+	    const treeBoundBox& qb = it();
+
+	    labelHashSet& usedBySender = cellsUsedByProc[sender];
+	    forAll(C, cellI)
 	    {
-		continue;
+		if (qb.contains(C[cellI]))
+		{
+		    usedBySender.insert(cellI);
+		}
 	    }
 
-	    if (replyToProc[toProc].size())
+	    // Send back as a compact list
+	    labelList markedCells(usedBySender.size());
+	    label i = 0;
+	    forAllConstIter(labelHashSet, usedBySender, iter)
 	    {
-		UOPstream os(toProc, pBufs);
-		os << replyToProc[toProc];
+		const label localCell = iter.key();
+		markedCells[i++] = globalCells.toGlobal(localCell);
 	    }
+
+	    //Foam::sort(markedCells);
+	    UOPstream os(sender, rBufs);
+	    os << markedCells;
 	}
 
-	pBufs.finishedSends();
+	rBufs.finishedSends();
 
 	forAll(procToQuery, i)
 	{
 	    const label fromProc = procToQuery[i];
-
-	    if (pBufs.recvDataCount(fromProc))
+	    if (!rBufs.recvDataCount(fromProc))
 	    {
-		UIPstream is(fromProc, pBufs);
-		labelList lst;
-		is >> lst;
-		remoteCells[fromProc] = lst;
+		continue;
 	    }
+	    UIPstream is(fromProc, rBufs);
+	    labelList lst;
+	    is >> lst;
+
+	    remoteCellsPerProc[fromProc] = lst;
 	}
     }
 
     if (debug)
     {
-	label totalRemote = 0;
-	forAll(remoteCells, proc)
-	{
-	    totalRemote += remoteCells[proc].size();
-	}
+        label totalNeeded = 0;
+        forAll(procToQuery, i)
+        {
+            totalNeeded += remoteCellsPerProc[procToQuery[i]].size();
+        }
 
-	Pout<< "Total remote candidate cells received: " << totalRemote
-	    <<  endl;
+        Pout<< "Proc " << Pstream::myProcNo()
+            << " queried " << procToQuery.size()
+            << " procs, received total remote cells: " << totalNeeded
+            << nl;
     }
 
+    // ---------------------------------------------------------------------- //
+    // 6. step - write processors stencils for visualisation purposes
+    // ---------------------------------------------------------------------- //
 
-    if (debug)
+    writeStencilFields(mesh, cellsUsedByProc);
+
+    // ---------------------------------------------------------------------- //
+    // 7. step - Construct one list of all halo cells using global cell IDs
+    // ---------------------------------------------------------------------- //
+
+    labelList remoteCells;
+
+    forAll(remoteCells, p)
     {
-	Pout <<  "Processors " << Pstream::myProcNo() << " have remote cells on"
-	     << remoteCells.size() <<" processors. " << endl;
+	remoteCells.append(remoteCellsPerProc[p]);
     }
-    // Write processor stencils for visualisation purpose
-    //writeStencilPerProcFields(mesh, runTime, replyToProc, debug);
+    //Foam::sort(remoteCellsGlobal);
+
 
     Info<< "End." << endl;
     return 0;

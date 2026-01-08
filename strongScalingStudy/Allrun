@@ -9,8 +9,10 @@ source solids4FoamScripts.sh
 
 # Define configurations as space-separated strings
 configs=(
-    "BASE=base/hex-mesh-2D NAME=hex-2D UTIL_NAME=testBuildStencilsParallel UTIL_ARGS='-radius 0.25' USE_DUALMESH=0 USE_GMSH=0"
-    "BASE=base/hex-mesh-3D NAME=hex-3D UTIL_NAME=testBuildStencilsParallel UTIL_ARGS='-radius 0.25' USE_DUALMESH=0 USE_GMSH=0"
+    #"BASE=base/hex-mesh-2D NAME=hex-2D UTIL_NAME=testBuildStencilsParallel UTIL_ARGS='-radius 0.25' USE_DUALMESH=0 USE_GMSH=0"
+    #"BASE=base/hex-mesh-3D NAME=hex-3D UTIL_NAME=testBuildStencilsParallel UTIL_ARGS='-radius 0.25' USE_DUALMESH=0 USE_GMSH=0"
+    "BASE=base/hex-mesh-2D NAME=hex-2D UTIL_NAME=testBuildStencilsParallel_v2 UTIL_ARGS='-debug 0' USE_DUALMESH=0 USE_GMSH=0"
+    "BASE=base/hex-mesh-3D NAME=hex-3D UTIL_NAME=testBuildStencilsParallel_v2 UTIL_ARGS='-debug 0' USE_DUALMESH=0 USE_GMSH=0"
 )
 
 # Define number of cores to be tested
