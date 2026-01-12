@@ -46,6 +46,9 @@ Description
       it is faster to construct a tree and loop over tree (and maybe later to
       reuse that tree for stencil construction)
 
+    - I'm putting all remote cells in one pool. If we will use looping over all
+      remote cells I guess it make sense to keep them in processor lists
+
 Author
     Ivan Batistic, UCD.
     Philip Cardiff, UCD.
@@ -65,7 +68,8 @@ Author
 #include "labelPair.H"
 #include "processorPolyPatch.H"
 #include "globalIndex.H"
-
+#include "indexedOctree.H"
+#include "treeDataPoint.H"
 
 // * * * * * * * * * * * * * * Helper Functions  * * * * * * * * * * * * * * //
 
@@ -77,13 +81,198 @@ static labelList collectCellsUsingIndexedOctree
     const label N,
     const labelList& remoteGlobalCells,
     const vectorField& remoteCentres,
-    const globalIndex& globalCells
+    const globalIndex& globalCells,
+    const indexedOctree<treeDataPoint>& localTree,
+    const indexedOctree<treeDataPoint>& remoteTree,
+    const boolList& procPatchesCells
 )
 {
-    // To be added later for testing purpose. Maybe it can be faster than
-    // layer approach.
+    // Steps:
+    // 1) Build a octree on local mesh
+    // 2) Expand a sphere around face centre until i have required number of
+    //    candidates
+    // 3) Sort candidates by distance
+    // 4) Check first N candidates are they on processor boundary
+    // 5) Add remote candidates, queried using linear scan or octree
 
-    labelList faceStencil(N);
+    // Comments:
+    //  At step 1 we can reuse local octree if we have it already. In this code
+    //  I'm not using it before but it can be used for marking cells in proc
+    //  communication. If this code in this version  shows to be faster
+    //  than layer technique this will make it even faster.
+
+    const scalar relTol = 1e-10;
+
+    const labelUList& owner = mesh.faceOwner();
+    const vector faceCentre = mesh.Cf()[faceI];
+    const pointField& cellCentres = mesh.C();
+
+    // Maximum sphere radius
+    const scalar maxRadius = 2.0*mesh.bounds().mag() + SMALL;
+
+    // Initial sphere radius
+    scalar r = 8.0*mag(faceCentre - cellCentres[owner[faceI]]);
+
+    labelList localCandidates;
+
+    const label localN = (6*N + 4) / 5;   // ceil(1.2*N)
+    while (true)
+    {
+        localCandidates = localTree.findSphere(faceCentre, sqr(r));
+
+        if (localCandidates.size() >= localN || r >= maxRadius)
+        {
+            break;
+        }
+        r *= 1.5;
+    }
+
+    if (localCandidates.empty())
+    {
+        FatalErrorInFunction
+            << "Octree returned zero local candidates for face " << faceI << nl
+            << exit(FatalError);
+    }
+
+    // Sort local candidates by distance
+    List<Tuple2<label, scalar>> localDist(localCandidates.size());
+    forAll(localCandidates, i)
+    {
+        const label cI = localCandidates[i];
+        localDist[i] =
+            Tuple2<label, scalar>(cI, magSqr(cellCentres[cI] - faceCentre));
+    }
+
+    Foam::sort
+    (
+        localDist,
+        [](const Tuple2<label, scalar>& A, const Tuple2<label, scalar>& B)
+        {
+            return A.second() < B.second();
+        }
+    );
+
+    // Check do we need to add remote cells
+    bool localStencil = true;
+    const label nCheck = min(N, localDist.size());
+
+    for (label pos = 0; pos < nCheck; ++pos)
+    {
+        const label& cellID = localDist[pos].first();
+        if (procPatchesCells[cellID])
+        {
+            localStencil = false;
+            break;
+        }
+    }
+
+    // If stencil is local we can already return the stencil
+    if (localStencil)
+    {
+        if ( localDist.size() < N )
+        {
+            FatalErrorInFunction
+                << "Local candidates for stencil have size of: "
+                << localDist.size()
+                << " but required minimum  stencil size is larger: " << N << nl
+                << "Increase the mesh size!"
+                << exit(FatalError);
+        }
+
+        // Enlarge stencil to include cells with the same distance
+        const scalar cut = localDist[N-1].second();
+        const scalar cutTol = cut*(1.0 + relTol);
+
+        label nPick = N;
+        while (nPick < localDist.size() && localDist[nPick].second() <= cutTol)
+        {
+            ++nPick;
+        }
+
+        labelList stencil(nPick);
+        for (label i = 0; i < nPick; ++i)
+        {
+            const label localCellID = localDist[i].first();
+            stencil[i] = globalCells.toGlobal(localCellID);
+        }
+
+        return stencil;
+    }
+
+    // Get radius at the position N
+    label posR = min(N-1, localDist.size()-1);
+    posR = min(max(posR, 0), localDist.size()-1);
+
+    // We store local distances as magSqrt to avoid calculating sqrt
+    const scalar localR2 = (localDist[posR].second());
+
+    DynamicList<Tuple2<label, scalar>> allDist;
+    allDist.reserve((posR + 1) + 256);
+
+    // Local cells within local stencil radius
+    for (label i = 0; i <= posR; ++i)
+    {
+        const label cellID = localDist[i].first();
+        const label globalCellID = globalCells.toGlobal(cellID);
+        allDist.append(Tuple2<label, scalar>(globalCellID, localDist[i].second()));
+    }
+
+    // Add all remote cells within local stencil radius
+    if (!remoteGlobalCells.empty())
+    {
+        // Get remote candidates from constructed remote tree
+        labelList remoteCandidates = remoteTree.findSphere(faceCentre, localR2);
+
+        // Add remote candidates to the local one
+        forAll(remoteCandidates, i)
+        {
+            const label& pos = remoteCandidates[i];
+            allDist.append
+            (
+                Tuple2<label, scalar>
+                (
+                    remoteGlobalCells[pos],
+                    magSqr(remoteCentres[pos] - faceCentre)
+                )
+            );
+        }
+
+        // Sort again local and remote cells together
+        Foam::sort
+        (
+            allDist,
+            [](const Tuple2<label, scalar>& A, const Tuple2<label, scalar>& B)
+            {
+                return A.second() < B.second();
+            }
+        );
+    }
+
+    // Check minimum stencil size
+    if ( allDist.size() < N )
+    {
+        FatalErrorInFunction
+            << "Candidates for stencil have size of: " << allDist.size()
+            << " but required minimum stencil size is larger: " << N << nl
+            << "Increase the mesh size!"
+            << exit(FatalError);
+    }
+
+    // Enlarge stencil to include cells with the same distance
+    const scalar cut = allDist[N-1].second();
+    const scalar cutTol = cut*(1.0 + relTol);
+
+    label nPick = N;
+    while (nPick < allDist.size() && allDist[nPick].second() <= cutTol)
+    {
+        ++nPick;
+    }
+
+    labelList faceStencil(nPick);
+    for (label i = 0; i < nPick; ++i)
+    {
+        faceStencil[i] = allDist[i].first();
+    }
 
     return faceStencil;
 }
@@ -102,7 +291,7 @@ static labelList collectCellsUsingLayers
 {
     // Number of cell layers fetched to get N closest cells
     // Number of layers is controled in terms of overSampleFactor
-    label overSampleFactor = 4;
+    label overSampleFactor = 3;
 
     const label nbOfCandidates = N * overSampleFactor;
 
@@ -192,13 +381,13 @@ static labelList collectCellsUsingLayers
         localDist[i] = Tuple2<label, scalar>(cI, magSqr(C[cI] - faceCentre));
     }
 
-    Foam::stableSort
+    Foam::sort
     (
         localDist,
-	[](auto& A, auto& B)
-	{
-	    return A.second() < B.second();
-	}
+        [](auto& A, auto& B)
+        {
+            return A.second() < B.second();
+        }
     );
 
     // Phase 2: Check first N local candidates for processor boundary touch
@@ -208,28 +397,28 @@ static labelList collectCellsUsingLayers
 
     for (label pos = 0; pos < nCheck; ++pos)
     {
-	const label& cellID = localDist[pos].first();
-	if (procPatchesCells[cellID])
-	{
-	    localStencil = false;
-	    break;
-	}
+        const label& cellID = localDist[pos].first();
+        if (procPatchesCells[cellID])
+        {
+            localStencil = false;
+            break;
+        }
     }
 
     // If stencil is local we can already return the stencil
     if (localStencil)
     {
-	if ( localList.size() < N )
-	{
-	    FatalErrorInFunction
-		<< "Local candidates for stencil have size of: "
-		<< localList.size()
-		<< " but required minimum  stencil size is larger: " << N << nl
-		<< "Increase the mesh size!"
-		<< exit(FatalError);
-	}
+        if ( localList.size() < N )
+        {
+            FatalErrorInFunction
+                << "Local candidates for stencil have size of: "
+                << localList.size()
+                << " but required minimum  stencil size is larger: " << N << nl
+                << "Increase the mesh size!"
+                << exit(FatalError);
+        }
 
-	// Enlarge stencil to include cells with the same distance
+        // Enlarge stencil to include cells with the same distance
         const scalar cut = localDist[N-1].second();
         const scalar cutTol = cut*(1.0 + relTol);
 
@@ -277,7 +466,7 @@ static labelList collectCellsUsingLayers
     }
 
     // Sort again local and remote cells together
-    Foam::stableSort
+    Foam::sort
     (
         allDist,
         [](const Tuple2<label, scalar>& A, const Tuple2<label, scalar>& B)
@@ -289,11 +478,11 @@ static labelList collectCellsUsingLayers
     // Check minimum stencil size
     if ( allDist.size() < N )
     {
-	FatalErrorInFunction
-	    << "Candidates for stencil have size of: " << allDist.size()
-	    << " but required minimum stencil size is larger: " << N << nl
-	    << "Increase the mesh size!"
-	    << exit(FatalError);
+        FatalErrorInFunction
+            << "Candidates for stencil have size of: " << allDist.size()
+            << " but required minimum stencil size is larger: " << N << nl
+            << "Increase the mesh size!"
+            << exit(FatalError);
     }
 
     // Enlarge stencil to include cells with the same distance
@@ -303,13 +492,13 @@ static labelList collectCellsUsingLayers
     label nPick = N;
     while (nPick < allDist.size() && allDist[nPick].second() <= cutTol)
     {
-	++nPick;
+        ++nPick;
     }
 
     labelList faceStencil(nPick);
     for (label i = 0; i < nPick; ++i)
     {
-	faceStencil[i] = allDist[i].first();
+        faceStencil[i] = allDist[i].first();
     }
 
     return faceStencil;
@@ -328,49 +517,87 @@ static labelList buildFacesStencil
 {
     labelList  faceStencil;
 
+    // Flag cells at processor boundary, this flag is used to check if
+    // stencil is on owned cells or it is necesary to loop over remote cells
+    boolList procPatchesCells(mesh.nCells(), false);
+
+    forAll(mesh.boundaryMesh(), patchI)
+    {
+        const polyPatch& pp = mesh.boundaryMesh()[patchI];
+        if (isA<processorPolyPatch>(pp))
+        {
+            const labelUList& faceCells = pp.faceCells();
+            forAll(faceCells, i)
+            {
+                procPatchesCells[faceCells[i]] = true;
+            }
+        }
+    }
+
+
     if (true)
     {
-	// Flag cells at processor boundary, this flag is used to check if
-	// stencil is on owned cells or it is necesary to loop over remote cells
-	boolList procPatchesCells(mesh.nCells(), false);
-
-	forAll(mesh.boundaryMesh(), patchI)
-	{
-	    const polyPatch& pp = mesh.boundaryMesh()[patchI];
-	    if (isA<processorPolyPatch>(pp))
-	    {
-		const labelUList& faceCells = pp.faceCells();
-		forAll(faceCells, i)
-		{
-		    procPatchesCells[faceCells[i]] = true;
-		}
-	    }
-	}
-
-	faceStencil  =
-	    collectCellsUsingLayers
-	    (
-	        faceI,
-		mesh,
-		N,
-		remoteGlobalCells,
-		remoteCentres,
-		globalCells,
-		procPatchesCells
-	    );
+        faceStencil  =
+            collectCellsUsingLayers
+            (
+                faceI,
+                mesh,
+                N,
+                remoteGlobalCells,
+                remoteCentres,
+                globalCells,
+                procPatchesCells
+            );
     }
     else
     {
-	faceStencil  =
-	    collectCellsUsingIndexedOctree
-	    (
-	        faceI,
-		mesh,
-		N,
-		remoteGlobalCells,
-		remoteCentres,
-		globalCells
-	    );
+        // Construct local tree
+        const pointField& cellCentres = mesh.C();
+
+        treeBoundBox bb(cellCentres);
+        bb.grow(1e-6*mesh.bounds().mag() + SMALL);
+
+        indexedOctree<treeDataPoint> localTree
+        (
+             treeDataPoint(cellCentres),
+             bb,
+             8,    // maxTreeDepth
+             16,   // leafSize
+             1.0   // duplicity
+         );
+
+        // Construct remote tree
+        pointField remotePoints(remoteCentres.size());
+        forAll(remoteCentres, i)
+        {
+            remotePoints[i] = remoteCentres[i];
+        }
+
+        treeBoundBox rbb(remotePoints);
+        rbb.grow(1e-6*mesh.bounds().mag() + SMALL);
+
+        indexedOctree<treeDataPoint> remoteTree
+        (
+            treeDataPoint(remotePoints),
+            rbb,
+            8,
+            16,
+            1.0
+        );
+
+        faceStencil  =
+            collectCellsUsingIndexedOctree
+            (
+                faceI,
+                mesh,
+                N,
+                remoteGlobalCells,
+                remoteCentres,
+                globalCells,
+                localTree,
+                remoteTree,
+                procPatchesCells
+            );
     }
 
     return faceStencil;
@@ -423,6 +650,51 @@ static PtrList<volScalarField> writeStencilFields
 }
 
 
+static void writeFaceStencilField
+(
+    const fvMesh& mesh,
+    const label& faceI,
+    const globalIndex& globalCells,
+    const labelList& faceStencilGlobal
+)
+{
+    const word fieldName("stencilFace-" + Foam::name(faceI));
+
+    volScalarField f
+    (
+        IOobject
+        (
+            fieldName,
+            mesh.time().timeName(),
+            mesh,
+            IOobject::NO_READ,
+            IOobject::AUTO_WRITE
+        ),
+        mesh,
+        dimensionedScalar("zero", dimless, 0.0)
+    );
+
+    // Mark only local-owned cells (each rank writes its own contribution)
+    forAll(faceStencilGlobal, i)
+    {
+        const label gid = faceStencilGlobal[i];
+        Info<< "Face: " << faceI << " stencil is: " << gid << endl;
+        if (globalCells.whichProcID(gid) == Pstream::myProcNo())
+        {
+            const label lc = globalCells.toLocal(gid);
+            if (lc >= 0 && lc < mesh.nCells())
+            {
+                f[lc] = 1.0;
+            }
+        }
+    }
+
+    f.correctBoundaryConditions();
+    f.write();
+
+    Info<< "Wrote " << fieldName << " for face " << faceI << nl;
+}
+
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
 
@@ -432,12 +704,19 @@ int main(int argc, char *argv[])
     (
         "Collapsed (box-based) stencil marking + remote cell ID cache builder"
         "Writes processor stencils stencilProc0..stencilProcN-1 as "
-	"volScalarFields."
+        "volScalarFields."
     );
 
     argList::addOption
     (
         "debug", "label", "Debug level"
+    );
+
+    argList::addOption
+    (
+        "writeFaceStencil",
+        "label",
+        "Write stencil membership field for this face (global face index)."
     );
 
     #include "setRootCase.H"
@@ -447,11 +726,20 @@ int main(int argc, char *argv[])
     label debug = 0;
     if (args.found("debug"))
     {
-	debug = readLabel(args["debug"]);
+        debug = readLabel(args["debug"]);
     }
 
     Info<< "Debug level = " << debug << nl << endl;
     Info<< "Testing on nProcs: " << Pstream::nProcs() << endl;
+
+    label writeFaceI = -1;
+    if (args.found("writeFaceStencil"))
+    {
+        IStringStream is(args.lookup("writeFaceStencil"));
+        writeFaceI = readLabel(is);
+
+        Info<< "Requested stencil output for face " << writeFaceI << nl;
+    }
 
     // ---------------------------------------------------------------------- //
     // 0. step - Basic preliminaries
@@ -463,8 +751,8 @@ int main(int argc, char *argv[])
 
     if (debug)
     {
-	Pout<< "Processor: " << Pstream::myProcNo() << " owns "
-	    << nLocalCells << " cells" << endl;
+        Pout<< "Processor: " << Pstream::myProcNo() << " owns "
+            << nLocalCells << " cells" << endl;
     }
 
     // ---------------------------------------------------------------------- //
@@ -483,30 +771,30 @@ int main(int argc, char *argv[])
 
     forAll(mesh.boundaryMesh(), patchI)
     {
-	const polyPatch& pp = mesh.boundaryMesh()[patchI];
-	if (isA<processorPolyPatch>(pp))
-	{
-	    const vectorField& Sf = pp.faceAreas();
-	    const labelUList& faceCells = pp.faceCells();
-	    forAll(faceCells, i)
-	    {
-		haloCells.insert(faceCells[i]);
-		procPatchArea += mag(Sf[i]);
-		haloVol += V[faceCells[i]];
-	    }
-	}
+        const polyPatch& pp = mesh.boundaryMesh()[patchI];
+        if (isA<processorPolyPatch>(pp))
+        {
+            const vectorField& Sf = pp.faceAreas();
+            const labelUList& faceCells = pp.faceCells();
+            forAll(faceCells, i)
+            {
+                haloCells.insert(faceCells[i]);
+                procPatchArea += mag(Sf[i]);
+                haloVol += V[faceCells[i]];
+            }
+        }
     }
 
     // Halo depth on this processor
     const scalar haloDepthLocal  =
-    	(procPatchArea > 0 ? haloVol/procPatchArea : 0.0);
+        (procPatchArea > 0 ? haloVol/procPatchArea : 0.0);
 
     if (debug)
     {
-	Pout<< "Processor: " << Pstream::myProcNo() << " halo thicnkess depth "
-	    << "on this processor: " << haloDepthLocal
-	    << ", halo volume: " << haloVol << ", procPatch area: "
-	    << procPatchArea << endl;
+        Pout<< "Processor: " << Pstream::myProcNo() << " halo thicnkess depth "
+            << "on this processor: " << haloDepthLocal
+            << ", halo volume: " << haloVol << ", procPatch area: "
+            << procPatchArea << endl;
     }
 
     // We need to exchance halo depths, becouse this processor needs halo depth
@@ -514,13 +802,13 @@ int main(int argc, char *argv[])
     labelHashSet nbrSet;
     forAll(mesh.boundaryMesh(), patchI)
     {
-	const polyPatch& pp = mesh.boundaryMesh()[patchI];
-	if (isA<processorPolyPatch>(pp))
-	{
-	    const processorPolyPatch& ppp =
-		refCast<const processorPolyPatch>(pp);
-	    nbrSet.insert(ppp.neighbProcNo());
-	}
+        const polyPatch& pp = mesh.boundaryMesh()[patchI];
+        if (isA<processorPolyPatch>(pp))
+        {
+            const processorPolyPatch& ppp =
+                refCast<const processorPolyPatch>(pp);
+            nbrSet.insert(ppp.neighbProcNo());
+        }
     }
 
     labelList nbrs(nbrSet.toc());
@@ -531,29 +819,29 @@ int main(int argc, char *argv[])
     PstreamBuffers pBufs(Pstream::commsTypes::nonBlocking);
     forAll(nbrs, i)
     {
-	UOPstream os(nbrs[i], pBufs);
-	os << haloDepthLocal;
+        UOPstream os(nbrs[i], pBufs);
+        os << haloDepthLocal;
     }
     pBufs.finishedSends();
 
     forAll(nbrs, i)
     {
-	const label from = nbrs[i];
-	if (pBufs.recvDataCount(from))
-	{
-	    UIPstream is(from, pBufs);
-	    scalar lenN;
-	    is >> lenN;
-	    neighHaloDepth[from] = lenN;
-	}
+        const label from = nbrs[i];
+        if (pBufs.recvDataCount(from))
+        {
+            UIPstream is(from, pBufs);
+            scalar lenN;
+            is >> lenN;
+            neighHaloDepth[from] = lenN;
+        }
     }
 
     const scalar haloDepth = 5 * max(neighHaloDepth);
 
     if (debug)
     {
-	Pout<< "Processor: " << Pstream::myProcNo() << " halo thicnkess depth "
-	    << "on neigbours multiplied with scaling: " << haloDepth << endl;
+        Pout<< "Processor: " << Pstream::myProcNo() << " halo thicnkess depth "
+            << "on neigbours multiplied with scaling: " << haloDepth << endl;
     }
 
     // ---------------------------------------------------------------------- //
@@ -562,21 +850,21 @@ int main(int argc, char *argv[])
 
     treeBoundBox ownedFacesBox;
     {
-	vector minPt(GREAT, GREAT, GREAT);
-	vector maxPt(-GREAT, -GREAT, -GREAT);
+        vector minPt(GREAT, GREAT, GREAT);
+        vector maxPt(-GREAT, -GREAT, -GREAT);
 
-	forAll(mesh.faces(), faceI)
-	{
-	    const point& faceCentre = mesh.faceCentres()[faceI];
-	    minPt = min(minPt, faceCentre);
-	    maxPt = max(maxPt, faceCentre);
-	}
+        forAll(mesh.faces(), faceI)
+        {
+            const point& faceCentre = mesh.faceCentres()[faceI];
+            minPt = min(minPt, faceCentre);
+            maxPt = max(maxPt, faceCentre);
+        }
 
-	// Expand domain for halo thickness
-	minPt -= vector(haloDepth, haloDepth, haloDepth);
-	maxPt += vector(haloDepth, haloDepth, haloDepth);
+        // Expand domain for halo thickness
+        minPt -= vector(haloDepth, haloDepth, haloDepth);
+        maxPt += vector(haloDepth, haloDepth, haloDepth);
 
-	ownedFacesBox = treeBoundBox(minPt, maxPt);
+        ownedFacesBox = treeBoundBox(minPt, maxPt);
     }
 
     // ---------------------------------------------------------------------- //
@@ -586,14 +874,14 @@ int main(int argc, char *argv[])
 
     treeBoundBox ownedCellsBox;
     {
-	vector minPt(GREAT, GREAT, GREAT);
-	vector maxPt(-GREAT, -GREAT, -GREAT);
+        vector minPt(GREAT, GREAT, GREAT);
+        vector maxPt(-GREAT, -GREAT, -GREAT);
 
-	forAll(C, celli)
-	{
-	    minPt = min(minPt, C[celli]);
-	    maxPt = max(maxPt, C[celli]);
-	}
+        forAll(C, celli)
+        {
+            minPt = min(minPt, C[celli]);
+            maxPt = max(maxPt, C[celli]);
+        }
 
         ownedCellsBox = treeBoundBox(minPt, maxPt);
     }
@@ -605,7 +893,7 @@ int main(int argc, char *argv[])
 
     if (debug)
     {
-	Info<< "Gathered processor cell boxes from all ranks." << nl << endl;
+        Info<< "Gathered processor cell boxes from all ranks." << nl << endl;
     }
 
     // ---------------------------------------------------------------------- //
@@ -616,20 +904,20 @@ int main(int argc, char *argv[])
 
     for (label proc = 0; proc < Pstream::nProcs(); ++proc)
     {
-	if (proc == Pstream::myProcNo())
-	{
-	    continue;
-	}
-	if (allOwnedCellsBox[proc].overlaps(ownedFacesBox))
-	{
-	    procToQuery.append(proc);
-	}
+        if (proc == Pstream::myProcNo())
+        {
+            continue;
+        }
+        if (allOwnedCellsBox[proc].overlaps(ownedFacesBox))
+        {
+            procToQuery.append(proc);
+        }
     }
 
     if (debug)
     {
-	Pout << "Processors " << Pstream::myProcNo() << " will query: "
-	     << procToQuery.size() << " processors: " << procToQuery << endl;
+        Pout << "Processors " << Pstream::myProcNo() << " will query: "
+             << procToQuery.size() << " processors: " << procToQuery << endl;
     }
 
     // ---------------------------------------------------------------------- //
@@ -651,85 +939,85 @@ int main(int argc, char *argv[])
 
     forAll(remoteGlobalCellsPerProc, procI)
     {
-	cellsUsedByProc[procI].clear();
-	remoteGlobalCellsPerProc[procI].clear();
+        cellsUsedByProc[procI].clear();
+        remoteGlobalCellsPerProc[procI].clear();
     }
 
     // Phase 1: Exchange treeBoundBoxes between processors
     Map<treeBoundBox> incomingBoxesFromProc;
     {
-	PstreamBuffers sBufs(Pstream::commsTypes::nonBlocking);
+        PstreamBuffers sBufs(Pstream::commsTypes::nonBlocking);
 
-	forAll(procToQuery, i)
-	{
-	    const label toProc = procToQuery[i];
-	    UOPstream os(toProc, sBufs);
-	    os << ownedFacesBox;
-	}
+        forAll(procToQuery, i)
+        {
+            const label toProc = procToQuery[i];
+            UOPstream os(toProc, sBufs);
+            os << ownedFacesBox;
+        }
 
-	sBufs.finishedSends();
+        sBufs.finishedSends();
 
-	for (label p = 0; p < Pstream::nProcs(); ++p)
-	{
-	    if (!sBufs.recvDataCount(p) || p == Pstream::myProcNo())
-	    {
-		continue;
-	    }
-	    UIPstream is(p, sBufs);
-	    treeBoundBox qb;
-	    is >> qb;
+        for (label p = 0; p < Pstream::nProcs(); ++p)
+        {
+            if (!sBufs.recvDataCount(p) || p == Pstream::myProcNo())
+            {
+                continue;
+            }
+            UIPstream is(p, sBufs);
+            treeBoundBox qb;
+            is >> qb;
 
-	    incomingBoxesFromProc.insert(p, qb);
-	}
+            incomingBoxesFromProc.insert(p, qb);
+        }
     }
 
     // Phase 2: Mark cells in overlaping boxes and fill out remoteGlobalCells list
     {
-	PstreamBuffers rBufs(Pstream::commsTypes::nonBlocking);
+        PstreamBuffers rBufs(Pstream::commsTypes::nonBlocking);
 
-	forAllConstIter(Map<treeBoundBox>, incomingBoxesFromProc, it)
-	{
-	    const label sender = it.key();
-	    const treeBoundBox& qb = it();
+        forAllConstIter(Map<treeBoundBox>, incomingBoxesFromProc, it)
+        {
+            const label sender = it.key();
+            const treeBoundBox& qb = it();
 
-	    labelHashSet& usedBySender = cellsUsedByProc[sender];
-	    forAll(C, cellI)
-	    {
-		if (qb.contains(C[cellI]))
-		{
-		    usedBySender.insert(cellI);
-		}
-	    }
+            labelHashSet& usedBySender = cellsUsedByProc[sender];
+            forAll(C, cellI)
+            {
+                if (qb.contains(C[cellI]))
+                {
+                    usedBySender.insert(cellI);
+                }
+            }
 
-	    // Send back as a compact list
-	    labelList markedCells(usedBySender.size());
-	    label i = 0;
-	    forAllConstIter(labelHashSet, usedBySender, iter)
-	    {
-		const label localCell = iter.key();
-		markedCells[i++] = globalCells.toGlobal(localCell);
-	    }
+            // Send back as a compact list
+            labelList markedCells(usedBySender.size());
+            label i = 0;
+            forAllConstIter(labelHashSet, usedBySender, iter)
+            {
+                const label localCell = iter.key();
+                markedCells[i++] = globalCells.toGlobal(localCell);
+            }
 
-	    //Foam::sort(markedCells);
-	    UOPstream os(sender, rBufs);
-	    os << markedCells;
-	}
+            //Foam::sort(markedCells);
+            UOPstream os(sender, rBufs);
+            os << markedCells;
+        }
 
-	rBufs.finishedSends();
+        rBufs.finishedSends();
 
-	forAll(procToQuery, i)
-	{
-	    const label fromProc = procToQuery[i];
-	    if (!rBufs.recvDataCount(fromProc))
-	    {
-		continue;
-	    }
-	    UIPstream is(fromProc, rBufs);
-	    labelList lst;
-	    is >> lst;
+        forAll(procToQuery, i)
+        {
+            const label fromProc = procToQuery[i];
+            if (!rBufs.recvDataCount(fromProc))
+            {
+                continue;
+            }
+            UIPstream is(fromProc, rBufs);
+            labelList lst;
+            is >> lst;
 
-	    remoteGlobalCellsPerProc[fromProc] = lst;
-	}
+            remoteGlobalCellsPerProc[fromProc] = lst;
+        }
     }
 
     if (debug)
@@ -750,7 +1038,10 @@ int main(int argc, char *argv[])
     // 6. step - write processors stencils for visualisation purposes
     // ---------------------------------------------------------------------- //
 
-    writeStencilFields(mesh, cellsUsedByProc);
+    if (debug)
+    {
+        writeStencilFields(mesh, cellsUsedByProc);
+    }
 
     // ---------------------------------------------------------------------- //
     // 7. step - Construct one list of all halo cells using global cell IDs
@@ -759,7 +1050,7 @@ int main(int argc, char *argv[])
     label nRemote = 0;
     forAll(remoteGlobalCellsPerProc, p)
     {
-	nRemote += remoteGlobalCellsPerProc[p].size();
+        nRemote += remoteGlobalCellsPerProc[p].size();
     }
     labelList remoteGlobalCells(nRemote);
 
@@ -767,13 +1058,13 @@ int main(int argc, char *argv[])
 
     forAll(remoteGlobalCellsPerProc, p)
     {
-	const labelList& ID = remoteGlobalCellsPerProc[p];
+        const labelList& ID = remoteGlobalCellsPerProc[p];
 
-	forAll(ID, i)
-	{
-	    remoteGlobalCells[k] = ID[i];
-	    ++k;
-	}
+        forAll(ID, i)
+        {
+            remoteGlobalCells[k] = ID[i];
+            ++k;
+        }
     }
 
     // ---------------------------------------------------------------------- //
@@ -784,113 +1075,113 @@ int main(int argc, char *argv[])
     remoteCellCentresPerProc.setSize(Pstream::nProcs());
 
     {
-	// Phase 1: send globalIds to each processor in contact
-	PstreamBuffers reqBufs(Pstream::commsTypes::nonBlocking);
+        // Phase 1: send globalIds to each processor in contact
+        PstreamBuffers reqBufs(Pstream::commsTypes::nonBlocking);
 
-	for (label p = 0; p < Pstream::nProcs(); ++p)
-	{
-	    if (p == Pstream::myProcNo() || remoteGlobalCellsPerProc[p].empty())
-	    {
-		continue;
-	    }
-	    const labelList& procGlobaCellID = remoteGlobalCellsPerProc[p];
+        for (label p = 0; p < Pstream::nProcs(); ++p)
+        {
+            if (p == Pstream::myProcNo() || remoteGlobalCellsPerProc[p].empty())
+            {
+                continue;
+            }
+            const labelList& procGlobaCellID = remoteGlobalCellsPerProc[p];
 
-	    UOPstream os(p, reqBufs);
-	    os << procGlobaCellID;
-	}
+            UOPstream os(p, reqBufs);
+            os << procGlobaCellID;
+        }
 
-	reqBufs.finishedSends();
+        reqBufs.finishedSends();
 
-	// Phase 2: respond with cell centre coordinates
-	PstreamBuffers repBufs(Pstream::commsTypes::nonBlocking);
+        // Phase 2: respond with cell centre coordinates
+        PstreamBuffers repBufs(Pstream::commsTypes::nonBlocking);
 
-	for (label fromProc = 0; fromProc < Pstream::nProcs(); ++fromProc)
-	{
-	    if
-	    (
-	        fromProc == Pstream::myProcNo()
-	     || !reqBufs.recvDataCount(fromProc)
-	    )
-	    {
-		continue;
-	    }
+        for (label fromProc = 0; fromProc < Pstream::nProcs(); ++fromProc)
+        {
+            if
+            (
+                fromProc == Pstream::myProcNo()
+             || !reqBufs.recvDataCount(fromProc)
+            )
+            {
+                continue;
+            }
 
-	    UIPstream is(fromProc, reqBufs);
+            UIPstream is(fromProc, reqBufs);
 
-	    labelList procGlobaCellID;
-	    is >> procGlobaCellID;
+            labelList procGlobaCellID;
+            is >> procGlobaCellID;
 
-	    vectorField centres(procGlobaCellID.size());
+            vectorField centres(procGlobaCellID.size());
 
 
-	     forAll(procGlobaCellID, i)
-	     {
-		 const label globaCellID = procGlobaCellID[i];
+             forAll(procGlobaCellID, i)
+             {
+                 const label globaCellID = procGlobaCellID[i];
 
-		 const label localCell = globalCells.toLocal(globaCellID);
+                 const label localCell = globalCells.toLocal(globaCellID);
 
-		 if (localCell < 0 || localCell >= mesh.nCells())
-		 {
-		     FatalErrorInFunction
-			 << "Invalid global->local mapping: globaCellID="
-			 << globaCellID << " localCell=" << localCell
-			 << " on proc " << Pstream::myProcNo() << nl
-			 << exit(FatalError);
-		 }
+                 if (localCell < 0 || localCell >= mesh.nCells())
+                 {
+                     FatalErrorInFunction
+                         << "Invalid global->local mapping: globaCellID="
+                         << globaCellID << " localCell=" << localCell
+                         << " on proc " << Pstream::myProcNo() << nl
+                         << exit(FatalError);
+                 }
 
-		 centres[i] = C[localCell];
-	     }
+                 centres[i] = C[localCell];
+             }
 
-	     UOPstream os(fromProc, repBufs);
-	     os << centres;
-	}
+             UOPstream os(fromProc, repBufs);
+             os << centres;
+        }
 
-	repBufs.finishedSends();
+        repBufs.finishedSends();
 
-	// Phase 3: Send back populated centres lists
-	for (label p = 0; p < Pstream::nProcs(); ++p)
-	{
-	    if (p == Pstream::myProcNo() || remoteGlobalCellsPerProc[p].empty())
-	    {
-		continue;
-	    }
+        // Phase 3: Send back populated centres lists
+        for (label p = 0; p < Pstream::nProcs(); ++p)
+        {
+            if (p == Pstream::myProcNo() || remoteGlobalCellsPerProc[p].empty())
+            {
+                continue;
+            }
 
-	    if (!repBufs.recvDataCount(p))
-	    {
-		FatalErrorInFunction
-		    << "Did not receive centres from proc " << p << nl
-		    << exit(FatalError);
-	    }
+            if (!repBufs.recvDataCount(p))
+            {
+                FatalErrorInFunction
+                    << "Did not receive centres from proc " << p << nl
+                    << exit(FatalError);
+            }
 
-	    UIPstream is(p, repBufs);
+            UIPstream is(p, repBufs);
 
-	    vectorField centres;
-	    is >> centres;
+            vectorField centres;
+            is >> centres;
 
-	    if (centres.size() != remoteGlobalCellsPerProc[p].size())
-	    {
-		FatalErrorInFunction
-		    << "Centres reply size mismatch from proc " << p
-		    << ": got " << centres.size()
-		    << " expected " << remoteGlobalCellsPerProc[p].size() << nl
-		    << exit(FatalError);
-	    }
+            if (centres.size() != remoteGlobalCellsPerProc[p].size())
+            {
+                FatalErrorInFunction
+                    << "Centres reply size mismatch from proc " << p
+                    << ": got " << centres.size()
+                    << " expected " << remoteGlobalCellsPerProc[p].size() << nl
+                    << exit(FatalError);
+            }
 
-	    remoteCellCentresPerProc[p].transfer(centres);
-	}
+            remoteCellCentresPerProc[p].transfer(centres);
+        }
 
-	if (debug)
-	{
-	    label nTot = 0;
-	    for (label p = 0; p < Pstream::nProcs(); ++p)
-	    {
-		nTot += remoteCellCentresPerProc[p].size();
-	    }
+        if (debug)
+        {
+            label nTot = 0;
+            for (label p = 0; p < Pstream::nProcs(); ++p)
+            {
+                nTot += remoteCellCentresPerProc[p].size();
+            }
 
-	    Pout<< "Proc " << Pstream::myProcNo()
-		<< " received remote centres for " << nTot
-		<< " cells (sum over procs)" << nl;
-	}
+            Pout<< "Proc " << Pstream::myProcNo()
+                << " received remote centres for " << nTot
+                << " cells (sum over procs)" << nl;
+        }
     }
 
     // ---------------------------------------------------------------------- //
@@ -900,7 +1191,7 @@ int main(int argc, char *argv[])
     nRemote = 0;
     forAll(remoteCellCentresPerProc, p)
     {
-	nRemote += remoteCellCentresPerProc[p].size();
+        nRemote += remoteCellCentresPerProc[p].size();
     }
     vectorField remoteCellCentres(nRemote);
 
@@ -908,39 +1199,39 @@ int main(int argc, char *argv[])
 
     forAll(remoteCellCentresPerProc, p)
     {
-	const vectorList& cellCentre = remoteCellCentresPerProc[p];
+        const vectorList& cellCentre = remoteCellCentresPerProc[p];
 
-	forAll(cellCentre, i)
-	{
-	    remoteCellCentres[k] = cellCentre[i];
-	    ++k;
-	}
+        forAll(cellCentre, i)
+        {
+            remoteCellCentres[k] = cellCentre[i];
+            ++k;
+        }
     }
 
     if (debug)
     {
-	if (remoteCellCentresPerProc.size() == remoteGlobalCellsPerProc.size())
-	{
-	    FatalErrorInFunction
-		<< "The size of cell centre list and cellGlobalID list are "
-		<< "not the same. Something went wrong."
-		<< exit(FatalError);
-	}
+        if (remoteCellCentresPerProc.size() != remoteGlobalCellsPerProc.size())
+        {
+            FatalErrorInFunction
+                << "The size of cell centre list and cellGlobalID list are "
+                << "not the same. Something went wrong."
+                << exit(FatalError);
+        }
 
-	forAll(remoteGlobalCellsPerProc, p)
-	{
-	    if
-	    (
-	        remoteGlobalCellsPerProc[p].size()
-	     != remoteCellCentresPerProc[p].size()
-	    )
-	    {
-		FatalErrorInFunction
-		    << "The size of cellCentre list and cellID list for proc: "
-		    << p << " are not matching. Something went wrong"
-		    << exit(FatalError);
-	    }
-	}
+        forAll(remoteGlobalCellsPerProc, p)
+        {
+            if
+            (
+                remoteGlobalCellsPerProc[p].size()
+             != remoteCellCentresPerProc[p].size()
+            )
+            {
+                FatalErrorInFunction
+                    << "The size of cellCentre list and cellID list for proc: "
+                    << p << " are not matching. Something went wrong"
+                    << exit(FatalError);
+            }
+        }
     }
 
     // ---------------------------------------------------------------------- //
@@ -949,7 +1240,7 @@ int main(int argc, char *argv[])
     // ---------------------------------------------------------------------- //
 
     // Number of cells in stencil
-    const label N = 30;
+    const label N = 15;
 
     // Number of required layer to be fetched depends on:
     //    a) the number of cells (interpolation order)
@@ -965,39 +1256,39 @@ int main(int argc, char *argv[])
     // Build stencil for internal faces
     for (label faceI = 0; faceI < mesh.nInternalFaces(); ++faceI)
     {
-	faceStencil[faceI] =
-	    buildFacesStencil
-	    (
-	        faceI,
-		mesh,
-		globalCells,
-		remoteGlobalCells,
-		remoteCellCentres,
-		N
-	    );
+        faceStencil[faceI] =
+            buildFacesStencil
+            (
+                faceI,
+                mesh,
+                globalCells,
+                remoteGlobalCells,
+                remoteCellCentres,
+                N
+            );
     }
 
     // Build stencil for boundary faces
     // Skip empty faces and non-owned processor faces to avoid double counting
     forAll(mesh.boundaryMesh(), patchI)
     {
-	const polyPatch& pp = mesh.boundaryMesh()[patchI];
+        const polyPatch& pp = mesh.boundaryMesh()[patchI];
 
-	if (isA<emptyPolyPatch>(pp))
-	{
-	    continue;
-	}
+        if (isA<emptyPolyPatch>(pp))
+        {
+            continue;
+        }
 
-	if (isA<processorPolyPatch>(pp))
-	{
-	    const processorPolyPatch& ppp =
-		refCast<const processorPolyPatch>(pp);
+        if (isA<processorPolyPatch>(pp))
+        {
+            const processorPolyPatch& ppp =
+                refCast<const processorPolyPatch>(pp);
 
-	    if (!ppp.owner())
-	    {
-		continue;
-	    }
-	}
+            if (!ppp.owner())
+            {
+                continue;
+            }
+        }
 
         forAll(pp, i)
         {
@@ -1006,16 +1297,59 @@ int main(int argc, char *argv[])
             faceStencil[faceI] =
                 buildFacesStencil
                 (
-		    faceI,
-		    mesh,
-		    globalCells,
-		    remoteGlobalCells,
-		    remoteCellCentres,
-		    N
+                    faceI,
+                    mesh,
+                    globalCells,
+                    remoteGlobalCells,
+                    remoteCellCentres,
+                    N
                 );
         }
     }
 
+    // ---------------------------------------------------------------------- //
+    // 11. step - write stencil for faceI for visualisation
+    // ---------------------------------------------------------------------- //
+
+    if (debug)
+    {
+        // Something is messing with second argList::addOption. I will hardcode
+        // face index here for testing purposes.
+        writeFaceI = 0;
+
+        if (writeFaceI >= 0)
+        {
+            if (writeFaceI < 0 || writeFaceI >= mesh.nFaces())
+            {
+                FatalErrorInFunction
+                    << "writeFaceStencil face index " << writeFaceI
+                    << " out of range [0.." << mesh.nFaces()-1 << "]" << nl
+                    << exit(FatalError);
+            }
+
+            writeFaceStencilField
+            (
+                mesh,
+                writeFaceI,
+                globalCells,
+                faceStencil[writeFaceI]
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------------- //
+    // 12. step - Filter out remote cells that are not needed to build stencils
+    // ---------------------------------------------------------------------- //
+
+
+    // ---------------------------------------------------------------------- //
+    // 13. step - Exchange D field between processors (only remote cells values)
+    // ---------------------------------------------------------------------- //
+
+
+    // ---------------------------------------------------------------------- //
+    // 14. step - Calculate gradient 100 times
+    // ---------------------------------------------------------------------- //
 
     Info<< "End." << endl;
     return 0;
