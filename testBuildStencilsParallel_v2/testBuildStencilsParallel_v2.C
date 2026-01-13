@@ -49,6 +49,10 @@ Description
     - I'm putting all remote cells in one pool. If we will use looping over all
       remote cells I guess it make sense to keep them in processor lists
 
+    - When calculating gradient I'm using globalCells.isLocal(neiGlobalCellI))
+      to check is the cell local or remote. Maybe we can save some time by
+      saving two lists?
+
 Author
     Ivan Batistic, UCD.
     Philip Cardiff, UCD.
@@ -80,7 +84,7 @@ static labelList collectCellsUsingIndexedOctree
     const fvMesh& mesh,
     const label N,
     const labelList& remoteGlobalCells,
-    const vectorField& remoteCentres,
+    const vectorList& remoteCentres,
     const globalIndex& globalCells,
     const indexedOctree<treeDataPoint>& localTree,
     const indexedOctree<treeDataPoint>& remoteTree,
@@ -115,7 +119,7 @@ static labelList collectCellsUsingIndexedOctree
 
     labelList localCandidates;
 
-    const label localN = (6*N + 4) / 5;   // ceil(1.2*N)
+    const label localN = (6*N + 4) / 5; // ceil(1.2*N)
     while (true)
     {
         localCandidates = localTree.findSphere(faceCentre, sqr(r));
@@ -284,14 +288,14 @@ static labelList collectCellsUsingLayers
     const fvMesh& mesh,
     const label N,
     const labelList& remoteGlobalCells,
-    const vectorField& remoteCentres,
+    const vectorList& remoteCentres,
     const globalIndex& globalCells,
     const boolList& procPatchesCells
 )
 {
     // Number of cell layers fetched to get N closest cells
     // Number of layers is controled in terms of overSampleFactor
-    label overSampleFactor = 3;
+    label overSampleFactor = 2;
 
     const label nbOfCandidates = N * overSampleFactor;
 
@@ -511,7 +515,7 @@ static labelList buildFacesStencil
     const fvMesh& mesh,
     const globalIndex& globalCells,
     const labelList& remoteGlobalCells,
-    const vectorField& remoteCentres,
+    const vectorList& remoteCentres,
     const label N
 )
 {
@@ -604,6 +608,161 @@ static labelList buildFacesStencil
 }
 
 
+static void exchangeRemoteDisplacement
+(
+    const fvMesh& mesh,
+    const globalIndex& globalCells,
+    const volVectorField& D,
+    vectorField& remoteD,
+    const labelList& remoteGlobalCells,
+    const labelList& procToQuery,
+    Map<label>& remoteIndexMapping
+)
+{
+    // Sort global cells per proc
+    // Should i use List of labelLists for each processors instead of combining
+    // them in one bucket?
+    List<DynamicList<label>> reqPerProc(Pstream::nProcs());
+
+    forAll(remoteGlobalCells, i)
+    {
+        const label globalID = remoteGlobalCells[i];
+        const label p = globalCells.whichProcID(globalID);
+        if (p == Pstream::myProcNo())
+        {
+            FatalErrorInFunction
+                << "Someting went wrong with addressing and local cell ended"
+                << " up in remote global cells list!"
+                << exit(FatalError);
+        }
+        reqPerProc[p].append(globalID);
+    }
+
+    // Request data from processors to query
+    PstreamBuffers pBufs(Pstream::commsTypes::nonBlocking);
+
+    forAll(procToQuery, ni)
+    {
+        const label p = procToQuery[ni];
+        if (reqPerProc[p].size())
+        {
+            UOPstream os(p, pBufs);
+            os << reqPerProc[p].shrink();
+        }
+        else
+        {
+            // Send an empty list so receiver can still recieve
+            UOPstream os(p, pBufs);
+            os << labelList();
+        }
+    }
+    pBufs.finishedSends();
+
+    // Prepare replies
+    List<DynamicList<label>> replyGlobalID(Pstream::nProcs());
+    List<DynamicList<vector>> replyValues(Pstream::nProcs());
+
+    forAll(procToQuery, I)
+    {
+        const label fromProc = procToQuery[I];
+
+        if (!pBufs.recvDataCount(fromProc))
+        {
+            continue;
+        }
+
+        UIPstream is(fromProc, pBufs);
+        labelList req;
+        is >> req;
+
+        if (req.empty())
+        {
+            continue;
+        }
+
+        replyGlobalID[fromProc].reserve(req.size());
+        replyValues[fromProc].reserve(req.size());
+
+        forAll(req, i)
+        {
+            const label globalID = req[i];
+
+            // This gid must belong to this processor
+            if (globalCells.whichProcID(globalID) != Pstream::myProcNo())
+            {
+                FatalErrorInFunction
+                    << "Received request for globalID=" << globalID
+                    << " but I do not own it. fromProc=" << fromProc << nl
+                    << exit(FatalError);
+            }
+
+            const label localID = globalCells.toLocal(globalID);
+            replyGlobalID[fromProc].append(globalID);
+            replyValues[fromProc].append(D[localID]);
+        }
+    }
+
+    // Send replies back
+    PstreamBuffers pBufs2(Pstream::commsTypes::nonBlocking);
+
+    forAll(procToQuery, I)
+    {
+        const label toProc = procToQuery[I];
+
+        UOPstream os(toProc, pBufs2);
+
+        os << replyGlobalID[toProc].shrink();
+        os << replyValues[toProc].shrink();
+    }
+    pBufs2.finishedSends();
+
+    // Recieve replies and fill remoteDisp field
+    forAll(procToQuery, I)
+    {
+        const label fromProc = procToQuery[I];
+
+        if (!pBufs2.recvDataCount(fromProc))
+        {
+            continue;
+        }
+
+        UIPstream is(fromProc, pBufs2);
+
+        labelList globalIDs;
+        vectorList values;
+        is >> globalIDs;
+        is >> values;
+
+        if (globalIDs.size() != values.size())
+        {
+            FatalErrorInFunction
+                << "Reply size mismatch from " << fromProc
+                << ": globalIDs=" << globalIDs.size()
+                << " values=" << values.size() << nl
+                << exit(FatalError);
+        }
+
+        forAll(globalIDs, i)
+        {
+            const label globalID = globalIDs[i];
+
+            // Map globalID -> compact slot
+            if (!remoteIndexMapping.found(globalID))
+            {
+                FatalErrorInFunction
+                    << "Received globalID=" << globalID
+                    << " but not in remoteIndexMapping on proc "
+                    << Pstream::myProcNo()
+                    << exit(FatalError);
+            }
+
+            const label pos = remoteIndexMapping[globalID];
+            remoteD[pos] = values[i];
+        }
+    }
+}
+
+
 static PtrList<volScalarField> writeStencilFields
 (
     const fvMesh& mesh,
@@ -654,6 +813,7 @@ static void writeFaceStencilField
 (
     const fvMesh& mesh,
     const label& faceI,
+    const label& proc,
     const globalIndex& globalCells,
     const labelList& faceStencilGlobal
 )
@@ -674,14 +834,15 @@ static void writeFaceStencilField
         dimensionedScalar("zero", dimless, 0.0)
     );
 
-    // Mark only local-owned cells (each rank writes its own contribution)
+    // Mark only local-owned cells (each rank writes its own local stencil)
     forAll(faceStencilGlobal, i)
     {
         const label gid = faceStencilGlobal[i];
-        Info<< "Face: " << faceI << " stencil is: " << gid << endl;
+
         if (globalCells.whichProcID(gid) == Pstream::myProcNo())
         {
             const label lc = globalCells.toLocal(gid);
+
             if (lc >= 0 && lc < mesh.nCells())
             {
                 f[lc] = 1.0;
@@ -712,13 +873,6 @@ int main(int argc, char *argv[])
         "debug", "label", "Debug level"
     );
 
-    argList::addOption
-    (
-        "writeFaceStencil",
-        "label",
-        "Write stencil membership field for this face (global face index)."
-    );
-
     #include "setRootCase.H"
     #include "createTime.H"
     #include "createMesh.H"
@@ -731,15 +885,6 @@ int main(int argc, char *argv[])
 
     Info<< "Debug level = " << debug << nl << endl;
     Info<< "Testing on nProcs: " << Pstream::nProcs() << endl;
-
-    label writeFaceI = -1;
-    if (args.found("writeFaceStencil"))
-    {
-        IStringStream is(args.lookup("writeFaceStencil"));
-        writeFaceI = readLabel(is);
-
-        Info<< "Requested stencil output for face " << writeFaceI << nl;
-    }
 
     // ---------------------------------------------------------------------- //
     // 0. step - Basic preliminaries
@@ -1193,7 +1338,7 @@ int main(int argc, char *argv[])
     {
         nRemote += remoteCellCentresPerProc[p].size();
     }
-    vectorField remoteCellCentres(nRemote);
+    vectorList remoteCellCentres(nRemote);
 
     k = 0;
 
@@ -1239,8 +1384,17 @@ int main(int argc, char *argv[])
     //            or indexedOctree.
     // ---------------------------------------------------------------------- //
 
-    // Number of cells in stencil
-    const label N = 15;
+    // Number of cells in stencil. We will use max expected value.
+    label N;
+
+    if (mesh.nGeometricD() == 2)
+    {
+        N = 20;
+    }
+    else
+    {
+        N = 100;
+    }
 
     // Number of required layer to be fetched depends on:
     //    a) the number of cells (interpolation order)
@@ -1314,8 +1468,11 @@ int main(int argc, char *argv[])
     if (debug)
     {
         // Something is messing with second argList::addOption. I will hardcode
-        // face index here for testing purposes.
-        writeFaceI = 0;
+        // global face index here for testing purposes.
+        const label writeFaceI = 0;
+
+        // Hardcode which processor
+        const label proc = 2;
 
         if (writeFaceI >= 0)
         {
@@ -1331,6 +1488,7 @@ int main(int argc, char *argv[])
             (
                 mesh,
                 writeFaceI,
+                proc,
                 globalCells,
                 faceStencil[writeFaceI]
             );
@@ -1341,15 +1499,200 @@ int main(int argc, char *argv[])
     // 12. step - Filter out remote cells that are not needed to build stencils
     // ---------------------------------------------------------------------- //
 
+    labelHashSet usedRemoteCells;
+    usedRemoteCells.reserve(remoteGlobalCells.size());
+
+    const label sizeBeforeFiltering = remoteGlobalCells.size();
+
+    // I need this for later processor communication. This mapping is used by
+    // nei processor to each determine which are the positions of his cells in
+    // te list that collects data from all processors.
+    Map<label> remoteIndexMapping;
+
+    forAll(faceStencil, faceI)
+    {
+        if (faceStencil.size())
+        {
+            const labelList& stencil = faceStencil[faceI];
+
+            forAll(stencil, I)
+            {
+                const label globalID = stencil[I];
+                if (globalCells.whichProcID(globalID) != Pstream::myProcNo())
+                {
+                    usedRemoteCells.insert(globalID);
+                }
+            }
+        }
+    }
+
+    if (usedRemoteCells.empty())
+    {
+        remoteGlobalCells.clear();
+        remoteCellCentres.clear();
+    }
+    else
+    {
+        DynamicList<label> filteredRemoteGlobalCells(remoteGlobalCells.size());
+        DynamicList<vector> filteredRemoteCellCentres(remoteCellCentres.size());
+
+        filteredRemoteGlobalCells.reserve(remoteGlobalCells.size());
+        filteredRemoteCellCentres.reserve(remoteCellCentres.size());
+
+        forAll(remoteGlobalCells, i)
+        {
+            const label globalID = remoteGlobalCells[i];
+            if (usedRemoteCells.found(globalID))
+            {
+                filteredRemoteGlobalCells.append(globalID);
+                filteredRemoteCellCentres.append(remoteCellCentres[i]);
+            }
+        }
+
+        remoteGlobalCells.transfer(filteredRemoteGlobalCells.shrink());
+        remoteCellCentres.transfer(filteredRemoteCellCentres.shrink());
+
+        remoteIndexMapping.clear();
+        remoteIndexMapping.resize(2*remoteGlobalCells.size() + 1);
+
+        forAll(remoteGlobalCells, i)
+        {
+            remoteIndexMapping.insert(remoteGlobalCells[i], i);
+        }
+    }
+
+    const label sizeAfterFiltering = remoteGlobalCells.size();
+
+    if (debug)
+    {
+        Pout<< "Proc " << Pstream::myProcNo()
+            << ", remote cells before filtering: " << sizeBeforeFiltering
+            << ", remote cells after filtering: " << sizeAfterFiltering
+            << endl;
+    }
 
     // ---------------------------------------------------------------------- //
-    // 13. step - Exchange D field between processors (only remote cells values)
+    // 13. step - Make local D field
     // ---------------------------------------------------------------------- //
 
+    volVectorField D
+    (
+        IOobject
+        (
+            "D",
+            runTime.timeName(),
+            mesh,
+            IOobject::NO_READ,
+            IOobject::NO_WRITE
+        ),
+        mesh,
+        dimensionedVector
+        (
+            "one",
+            dimless,
+            vector(Pstream::myProcNo(), Pstream::myProcNo(), Pstream::myProcNo())
+        )
+    );
 
     // ---------------------------------------------------------------------- //
-    // 14. step - Calculate gradient 100 times
+    // 14. step - Make remote D field (only for this proc halo cells) and get
+    //            remote values for it
     // ---------------------------------------------------------------------- //
+
+    vectorField remoteD(remoteGlobalCells.size(), vector::zero);
+
+    exchangeRemoteDisplacement
+    (
+        mesh,
+        globalCells,
+        D,
+        remoteD,
+        remoteGlobalCells,
+        procToQuery,
+        remoteIndexMapping
+    );
+
+    // ---------------------------------------------------------------------- //
+    // 14. step - Calculate gradient 100 times and also get remote values
+    //            100 time
+    // ---------------------------------------------------------------------- //
+
+    const vectorField& DI = D.internalField();
+
+    tensor t = tensor::zero;
+
+    // We will assume that each cell in stencil have the same interpolation
+    // coeff. We don't need to calculate coeffs with this utility
+    const vector gradCoeff = vector::one;
+
+    label iterate = 0;
+    while (iterate < 100)
+    {
+        // Exchange D field and get values from remote cells
+        exchangeRemoteDisplacement
+        (
+            mesh,
+            globalCells,
+            D,
+            remoteD,
+            remoteGlobalCells,
+            procToQuery,
+            remoteIndexMapping
+        );
+
+        // First we loop over internal faces
+        forAll(mesh.owner(), faceI)
+        {
+            const labelList& curStencil = faceStencil[faceI];
+
+            // For each face we loop over quadrature points
+            // Here we will assume that we have 6 points
+            for (label qp = 0; qp < 6; ++qp)
+            {
+                // For each quadrature point we loop over stencil cells
+                forAll(curStencil, cI)
+                {
+                    const label neiGlobalCellID = curStencil[cI];
+
+                    if (globalCells.isLocal(neiGlobalCellID))
+                    {
+                        // Local cell
+                        const label localID = globalCells.toLocal(neiGlobalCellID);
+                        t += gradCoeff * DI[localID];
+                    }
+                    else
+                    {
+                        // Remote cell
+                        const Map<label>::const_iterator it = remoteIndexMapping.find(neiGlobalCellID);
+
+                        t += gradCoeff * remoteD[it()];
+                    }
+                }
+            }
+        }
+
+        // Loop over boundary faces
+        // For speed testing purpose we can skip this loop
+        forAll(D.boundaryField(), patchI)
+        {
+            const polyPatch& pp = mesh.boundaryMesh()[patchI];
+
+            if (isA<emptyPolyPatch>(pp))
+            {
+                continue;
+            }
+            else if (isA<emptyPolyPatch>(pp))
+            {
+                continue;
+            }
+            else
+            {
+                continue;
+            }
+        }
+
+        iterate++;
+    }
 
     Info<< "End." << endl;
     return 0;
