@@ -1674,7 +1674,6 @@ int main(int argc, char *argv[])
         }
 
         // Loop over boundary faces
-        // For speed testing purpose we can skip this loop
         forAll(D.boundaryField(), patchI)
         {
             const polyPatch& pp = mesh.boundaryMesh()[patchI];
