@@ -12,4 +12,5 @@ then
 fi
 
 wclean testBuildStencilsParallel
+wclean testBuildStencilsParallel_v2
 (cd case && ./Allclean)

@@ -64,9 +64,10 @@ do
     do
         # Define results summary file name
         SUMMARY="${NAME}.mesh-${i}.summary.txt"
-        echo "# Cores CellsNumber Time Speed-up Mem" > "${SUMMARY}"
+        echo "# Cores CellsNumber Time Speed-up Looping-time Looping-speed-up" > "${SUMMARY}"
 
-	T1=""
+        T1=""
+        T1L=""
         # Loop over mesh densities in each configuration
         for NP in "${CORES[@]}"
         do
@@ -94,15 +95,15 @@ do
                 cp "system/blockMeshDict.${i}" "system/blockMeshDict"
                 solids4Foam::runApplication blockMesh
             fi
-    	    solids4Foam::runApplication checkMesh
+            solids4Foam::runApplication checkMesh
 
-    	    # Update the number of processors in decomposeParDict
+            # Update the number of processors in decomposeParDict
             sed -i "/^\s*numberOfSubdomains /s|^.*|numberOfSubdomains  ${NP};|" system/decomposeParDict
 
-    	    # Decompose the case
-    	    if [ "$NP" -ne 1 ]; then
-    		solids4Foam::runApplication decomposePar -cellDist
-    	    fi
+            # Decompose the case
+            if [ "$NP" -ne 1 ]; then
+                solids4Foam::runApplication decomposePar -cellDist
+            fi
 
             # Run the utility
             # If "gtime" is available (could be called "time" on Linux), use it to
@@ -119,14 +120,14 @@ do
             if command -v gtime &> /dev/null; then
                 echo "Running ${UTIL_NAME} on ${CASE} with gtime"
                 gtime -f "gtime/time (wall clock) time: %e
-                	  Maximum resident set size (kbytes): %M" \
+                          Maximum resident set size (kbytes): %M" \
                       "${RUN_CMD[@]}" &> "log.${UTIL_NAME}"
 
             elif [ -x /usr/bin/time ]; then
                 echo "Running ${UTIL_NAME} on ${CASE} with /usr/bin/time"
                 /usr/bin/time -f "gtime/time (wall clock) time: %e
-                	  Maximum resident set size (kbytes): %M" \
-    		  "${RUN_CMD[@]}" &> "log.${UTIL_NAME}"
+                          Maximum resident set size (kbytes): %M" \
+                  "${RUN_CMD[@]}" &> "log.${UTIL_NAME}"
 
             elif command -v time &> /dev/null; then
                 echo "Running ${UTIL_NAME} on ${CASE} with shell builtin time (no max memory)"
@@ -137,10 +138,10 @@ do
                 solids4Foam::runApplication "${RUN_CMD[@]}"
             fi
 
-    	    # Reconstruct the case
-    	    if [ "$NP" -ne 1 ]; then
-    		solids4Foam::runApplication reconstructPar -withZero
-    	    fi
+            # Reconstruct the case
+            if [ "$NP" -ne 1 ]; then
+                solids4Foam::runApplication reconstructPar -withZero
+            fi
 
             # Extract results from solver log and append them to a summary file
             echo; echo "Appending results to ${SUMMARY}"
@@ -151,7 +152,10 @@ do
                 CLOCK_TIME=$(grep "ClockTime" log."${UTIL_NAME}" | awk '{print $7}')
             fi
 
-    	    if grep -q "Maximum resident" log.${UTIL_NAME}; then
+            # Get looping time
+            LOOPING_TIME=$(grep "looping:" log."${UTIL_NAME}" | awk '{print $8}')
+
+            if grep -q "Maximum resident" log.${UTIL_NAME}; then
                 MAX_MEMORY=$(grep "Maximum resident" log."${UTIL_NAME}" | awk '{print int($6 / 1000)}')
             else
                 MAX_MEMORY="NaN"
@@ -160,24 +164,31 @@ do
             # Number of cells
             CELLS=$(grep "cells:" log.checkMesh | awk '{print $2}')
 
-	    # Save baseline time when running on 1 core
-	    if [ "$NP" -eq 1 ]; then
-		T1="$CLOCK_TIME"
-	    fi
+            # Save baseline time when running on 1 core
+            if [ "$NP" -eq 1 ]; then
+                T1="$CLOCK_TIME"
+                T1L="$LOOPING_TIME"
+            fi
 
-	    # Normalized time = T(NP) / T(1)
-	    SPEEDUP=$(awk -v t="$CLOCK_TIME" -v t1="$T1" 'BEGIN{
+            # Normalized time = T(NP) / T(1)
+            SPEEDUP=$(awk -v t="$CLOCK_TIME" -v t1="$T1" 'BEGIN{
+                if (t1=="" || t1==0) print "NaN";
+                else printf "%.6f", t1/t
+            }')
+
+            # Normalized time for looping= T(NP) / T(1)
+            LOOPING_SPEEDUP=$(awk -v t="$LOOPING_TIME" -v t1="$T1L" 'BEGIN{
                 if (t1=="" || t1==0) print "NaN";
                 else printf "%.6f", t1/t
             }')
 
             # Write data to file
-            echo "$NP $CELLS $CLOCK_TIME $SPEEDUP $MAX_MEMORY" >> ../"${SUMMARY}"
+            echo "$NP $CELLS $CLOCK_TIME $SPEEDUP $LOOPING_TIME $LOOPING_SPEEDUP" >> ../"${SUMMARY}"
 
             cd ..
         done
-	# Print summary file
-	echo; echo "${SUMMARY} file:"; cat "${SUMMARY}"; echo
+        # Print summary file
+        echo; echo "${SUMMARY} file:"; cat "${SUMMARY}"; echo
     done
 
 done

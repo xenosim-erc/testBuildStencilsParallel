@@ -293,11 +293,7 @@ static labelList collectCellsUsingLayers
     const boolList& procPatchesCells
 )
 {
-    // Number of cell layers fetched to get N closest cells
-    // Number of layers is controled in terms of overSampleFactor
-    label overSampleFactor = 2;
-
-    const label nbOfCandidates = N * overSampleFactor;
+    const label nbOfCandidates = (3*N + 1) / 2;   // ceil(1.5 * N)
 
     // When building stencils, stencil is larger than N if there are cells with
     // equall distance. We use relTol to detect such cases. This can help to
@@ -539,7 +535,7 @@ static labelList buildFacesStencil
     }
 
 
-    if (true)
+    if (false)
     {
         faceStencil  =
             collectCellsUsingLayers
@@ -1613,8 +1609,8 @@ int main(int argc, char *argv[])
     );
 
     // ---------------------------------------------------------------------- //
-    // 14. step - Calculate gradient 100 times and also get remote values
-    //            100 time
+    // 15. step - Calculate gradient 100 times and also get remote values
+    //            300 time
     // ---------------------------------------------------------------------- //
 
     const vectorField& DI = D.internalField();
@@ -1625,10 +1621,16 @@ int main(int argc, char *argv[])
     // coeff. We don't need to calculate coeffs with this utility
     const vector gradCoeff = vector::one;
 
+
+    // Monitor time for 300 iterations
+    Foam::clockTime wall;
+    UPstream::barrier(UPstream::worldComm);
+    (void)wall.timeIncrement();
+
     label iterate = 0;
-    while (iterate < 100)
+    while (iterate < 300)
     {
-        // Exchange D field and get values from remote cells
+        //Exchange D field and get values from remote cells
         exchangeRemoteDisplacement
         (
             mesh,
@@ -1681,17 +1683,64 @@ int main(int argc, char *argv[])
             {
                 continue;
             }
-            else if (isA<emptyPolyPatch>(pp))
+            else if (isA<processorPolyPatch>(pp))
             {
-                continue;
+                // Only owner-side processor faces (avoid double counting)
+                const processorPolyPatch& ppp = refCast<const processorPolyPatch>(pp);
+
+                if (!ppp.owner())
+                {
+                    continue;
+                }
+
+                forAll(pp, i)
+                {
+                    const label faceI = pp.start() + i;
+
+                    const labelList& curStencil = faceStencil[faceI];
+
+                    for (label qp = 0; qp < 6; ++qp)
+                    {
+                        forAll(curStencil, cI)
+                        {
+                            const label globalID = curStencil[cI];
+
+                            if (globalCells.isLocal(globalID))
+                            {
+                                const label localID = globalCells.toLocal(globalID);
+                                t += gradCoeff * DI[localID];
+                            }
+                            else
+                            {
+                                const Map<label>::const_iterator it = remoteIndexMapping.find(globalID);
+
+                                t += gradCoeff * remoteD[it()];
+                            }
+                        }
+                    }
+                }
             }
             else
             {
+                // For testing purpose we can skip boundary faces.
+                // Processor faces above were important to include to ensure
+                // fair comparison of timing.
                 continue;
             }
         }
 
         iterate++;
+    }
+
+
+    UPstream::barrier(UPstream::worldComm);
+    scalar elapsed = wall.timeIncrement();
+    reduce(elapsed, maxOp<scalar>());
+
+    if (Pstream::master())
+    {
+        Info<< "Max elapsed time per proc for looping: "
+            << elapsed << " s" << endl;
     }
 
     Info<< "End." << endl;
