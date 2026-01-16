@@ -535,7 +535,7 @@ static labelList buildFacesStencil
     }
 
 
-    if (false)
+    if (true)
     {
         faceStencil  =
             collectCellsUsingLayers
